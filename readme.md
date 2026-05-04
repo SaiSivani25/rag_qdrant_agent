@@ -260,16 +260,3 @@ The pipeline has been tested with the following document types:
 - Economics (Technological Unemployment)
 
 ---
-
-## Security Notes
-
-- Never commit `.env` to version control
-- Rotate API keys (Qdrant, Gemini) regularly
-- Use GCP Secret Manager for production deployments
-- Service account follows principle of least privilege
-
----
-
-## License
-
-MIT
