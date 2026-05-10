@@ -1,29 +1,54 @@
 import os
+import time
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+from google.api_core.exceptions import GoogleAPIError
 from google.cloud import storage
 
-# Load .env only if running locally
-if os.path.exists(Path(__file__).resolve().parent / ".env"):
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI()
 
-BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
-
-if not BUCKET_NAME or not PROJECT_ID:
-    raise RuntimeError("GCS_BUCKET_NAME and GCP_PROJECT_ID must be set")
-
-storage_client = storage.Client(project=PROJECT_ID)
+BUCKET_NAME = os.environ["GCS_BUCKET_NAME"]
+storage_client = storage.Client(project=os.environ["GCP_PROJECT_ID"])
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    results = {}
+    overall = "ok"
+
+    start = time.monotonic()
+    try:
+        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket.reload()
+        results["gcs"] = {
+            "status": "ok",
+            "latency_ms": round((time.monotonic() - start) * 1000),
+        }
+    except GoogleAPIError as e:
+        results["gcs"] = {
+            "status": "down",
+            "error": str(e),
+            "latency_ms": round((time.monotonic() - start) * 1000),
+        }
+        overall = "down"
+    except Exception as e:
+        results["gcs"] = {
+            "status": "down",
+            "error": str(e),
+            "latency_ms": round((time.monotonic() - start) * 1000),
+        }
+        overall = "down"
+
+    return JSONResponse(
+        status_code=503 if overall == "down" else 200,
+        content={"status": overall, "api": "upload-api", "services": results},
+    )
 
 
 @app.post("/upload")

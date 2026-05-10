@@ -1,6 +1,14 @@
 # RAG Qdrant Agent — Document Intelligence Pipeline
 
-A production-ready Retrieval-Augmented Generation (RAG) pipeline on Google Cloud Platform that automatically processes uploaded documents, extracts text via Document AI OCR, embeds it with Vertex AI, stores vectors in Qdrant, and answers natural language queries using Gemini.
+A production-ready Retrieval-Augmented Generation (RAG) pipeline on Google Cloud Platform that automatically processes uploaded documents, extracts text via Document AI OCR, embeds it with Vertex AI, stores vectors in Qdrant, and answers natural language queries using Gemini — with real-time streaming responses.
+
+---
+
+## What's New
+
+- **Deep health checks** — every API probes its dependencies with real calls, returning per-service status and latency
+- **Resilient processing** — per-batch retry with exponential backoff, idempotent point IDs, graceful handling of image-only pages
+- **SSE streaming** — query responses stream token by token in real time, exactly like ChatGPT
 
 ---
 
@@ -13,6 +21,7 @@ User Upload (PDF/JPEG)
 ┌─────────────────┐
 │   Upload API    │  ← Cloud Run (FastAPI)
 │  (upload_api/)  │
+│  GET /health    │  ← probes GCS bucket
 └────────┬────────┘
          │ stores file
          ▼
@@ -21,14 +30,14 @@ User Upload (PDF/JPEG)
 └────────┬────────┘
          │ Eventarc trigger (object.finalized)
          ▼
-┌─────────────────┐
-│ Process Document│  ← Cloud Function Gen2 (Python)
-│  (processing/)  │
-│                 │
-│ 1. Document AI  │  ← OCR text extraction
-│ 2. Vertex AI    │  ← text-embedding-004 (768 dims)
-│ 3. Qdrant       │  ← vector upsert
-└─────────────────┘
+┌──────────────────────────┐
+│   Process Document       │  ← Cloud Function Gen2 (Python)
+│   (processing/)          │
+│                          │
+│ 1. Document AI OCR       │  ← text extraction, skip image-only pages
+│ 2. Vertex AI Embeddings  │  ← batches of 5, retry 2s/10s/30s backoff
+│ 3. Qdrant batch upsert   │  ← idempotent IDs, 5 points per call
+└──────────────────────────┘
          │
          ▼
 ┌─────────────────┐
@@ -37,14 +46,16 @@ User Upload (PDF/JPEG)
 └────────┬────────┘
          │
          ▼
-┌─────────────────┐
-│   Query API     │  ← Cloud Run (FastAPI)
-│  (query_api/)   │
-│                 │
-│ 1. Embed query  │  ← Vertex AI
-│ 2. Search       │  ← Qdrant top-k
-│ 3. Generate     │  ← Gemini
-└─────────────────┘
+┌──────────────────────────┐
+│   Query API              │  ← Cloud Run (FastAPI)
+│   (query_api/)           │
+│   GET /health            │  ← probes Vertex AI + Qdrant + Gemini
+│                          │
+│ 1. Embed query           │  ← Vertex AI
+│ 2. Search                │  ← Qdrant top-3
+│ 3. Generate              │  ← Gemini 2.5 Flash
+│ 4. Stream or full JSON   │  ← SSE token/sources/done events
+└──────────────────────────┘
 ```
 
 ---
@@ -54,15 +65,15 @@ User Upload (PDF/JPEG)
 ```
 Rag_QdrantVB_Shivani/
 ├── upload_api/
-│   ├── main.py              # FastAPI upload endpoint
+│   ├── main.py              # FastAPI upload + deep health check
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── processing/
-│   ├── main.py              # Cloud Function — OCR + embed + store
+│   ├── main.py              # Resilient Cloud Function pipeline
 │   ├── setup_qdrant.py      # One-time Qdrant collection setup
 │   └── requirements.txt
 ├── query_api/
-│   ├── main.py              # FastAPI query endpoint
+│   ├── main.py              # FastAPI query (streaming + non-streaming)
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── document_rag_text/       # Sample PDFs (not committed)
@@ -80,7 +91,7 @@ Rag_QdrantVB_Shivani/
 | Cloud Functions (Gen2) | Event-driven document processing |
 | Cloud Storage | Stores uploaded documents |
 | Document AI (OCR) | Extracts text from PDFs and images |
-| Vertex AI | Generates text embeddings (`text-embedding-004`) |
+| Vertex AI | Generates text embeddings (text-embedding-004) |
 | Eventarc | Triggers Cloud Function on GCS upload |
 | Artifact Registry | Stores Docker container images |
 | Cloud Build | Builds containers on deploy |
@@ -94,6 +105,7 @@ Rag_QdrantVB_Shivani/
 - Python 3.11+
 - Qdrant Cloud account
 - Google AI Studio API key (Gemini)
+- **Windows: use Command Prompt (cmd), not PowerShell**
 
 ---
 
@@ -117,146 +129,214 @@ UPLOAD_API_URL=https://your-upload-api.run.app
 
 ---
 
-## Setup & Deployment
+## Setup & Deployment (Windows — use cmd)
 
 ### 1. GCP Setup
 
-```bash
-# Set project
+```cmd
 gcloud config set project YOUR_PROJECT_ID
 
-# Enable APIs
-gcloud services enable storage.googleapis.com documentai.googleapis.com \
-  aiplatform.googleapis.com run.googleapis.com eventarc.googleapis.com
+gcloud services enable storage.googleapis.com documentai.googleapis.com aiplatform.googleapis.com run.googleapis.com eventarc.googleapis.com cloudfunctions.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
 
-# Create GCS bucket
-gcloud storage buckets create gs://YOUR_BUCKET \
-  --location=us-central1 --uniform-bucket-level-access
+gcloud storage buckets create gs://YOUR_BUCKET --location=us-central1 --uniform-bucket-level-access
 
-# Create service account
-gcloud iam service-accounts create rag-document-sa \
-  --display-name "RAG Document Agent Service Account"
+gcloud iam service-accounts create rag-document-sa --display-name "RAG Document Agent Service Account"
 
-# Grant permissions
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/storage.admin"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/storage.admin"
 
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/documentai.apiUser"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/documentai.apiUser"
 
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/aiplatform.user"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/eventarc.eventReceiver"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/run.invoker"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/logging.logWriter"
 ```
 
-### 2. Qdrant Setup
+### 2. Eventarc Permissions
 
-```bash
+```cmd
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:service-YOUR_PROJECT_NUMBER@gs-project-accounts.iam.gserviceaccount.com" --role="roles/pubsub.publisher"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:service-YOUR_PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com" --role="roles/iam.serviceAccountTokenCreator"
+```
+
+### 3. Document AI Processor
+
+1. GCP Console → Document AI → Explore Processors
+2. Create → Document OCR → Region: `us`
+3. Copy the Processor ID to your `.env`
+
+### 4. Qdrant Setup
+
+1. [cloud.qdrant.io](https://cloud.qdrant.io) → create free cluster
+2. Copy URL and API key to `.env`
+3. Run collection setup from cmd:
+
+```cmd
 cd processing
 python setup_qdrant.py
 ```
 
-### 3. Deploy Upload API
+### 5. Virtual Environment (Windows)
 
-```bash
+```cmd
+python -m venv rag_agent
+rag_agent\Scripts\activate.bat
+```
+
+### 6. Deploy Upload API
+
+```cmd
 cd upload_api
-gcloud run deploy upload-api \
-  --source . \
-  --region us-central1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --service-account=rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
-  --set-env-vars="GCS_BUCKET_NAME=YOUR_BUCKET,GCP_PROJECT_ID=YOUR_PROJECT_ID" \
-  --min-instances=0 --max-instances=1
+gcloud run deploy upload-api --source . --region us-central1 --allow-unauthenticated --set-env-vars "GCS_BUCKET_NAME=YOUR_BUCKET,GCP_PROJECT_ID=YOUR_PROJECT_ID,GCP_REGION=us-central1"
 ```
 
-### 4. Deploy Processing Cloud Function
+### 7. Deploy Processing Pipeline
 
-```bash
+```cmd
 cd processing
-gcloud functions deploy process-document \
-  --gen2 \
-  --runtime=python311 \
-  --region=us-central1 \
-  --source=. \
-  --entry-point=process_document \
-  --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
-  --trigger-event-filters="bucket=YOUR_BUCKET" \
-  --service-account=rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
-  --set-env-vars="GCP_PROJECT_ID=YOUR_PROJECT_ID,GCP_REGION=us-central1,DOCAI_PROCESSOR_ID=YOUR_PROCESSOR_ID,DOCAI_LOCATION=us,QDRANT_URL=YOUR_QDRANT_URL,QDRANT_API_KEY=YOUR_QDRANT_KEY" \
-  --memory=2Gi --timeout=300s
+gcloud functions deploy process-document --gen2 --runtime=python311 --region=us-central1 --source=. --entry-point=process_document --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" --trigger-event-filters="bucket=YOUR_BUCKET_NAME" --memory=2Gi --timeout=300s --set-env-vars "GCP_PROJECT_ID=YOUR_PROJECT_ID,GCP_REGION=us-central1,GCS_BUCKET_NAME=YOUR_BUCKET,DOCAI_PROCESSOR_ID=YOUR_PROCESSOR_ID,DOCAI_LOCATION=us,QDRANT_URL=YOUR_QDRANT_URL,QDRANT_API_KEY=YOUR_QDRANT_KEY"
 ```
 
-### 5. Deploy Query API
+### 8. Deploy Query API
 
-```bash
+```cmd
 cd query_api
-gcloud run deploy query-api \
-  --source . \
-  --region us-central1 \
-  --platform managed \
-  --allow-unauthenticated \
-  --service-account=rag-document-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
-  --set-env-vars="GCP_PROJECT_ID=YOUR_PROJECT_ID,GCP_REGION=us-central1,QDRANT_URL=YOUR_QDRANT_URL,QDRANT_API_KEY=YOUR_QDRANT_KEY,GEMINI_API_KEY=YOUR_GEMINI_KEY" \
-  --min-instances=0 --max-instances=1
+gcloud run deploy query-api --source . --region us-central1 --allow-unauthenticated --set-env-vars "GCP_PROJECT_ID=YOUR_PROJECT_ID,GCP_REGION=us-central1,QDRANT_URL=YOUR_QDRANT_URL,QDRANT_API_KEY=YOUR_QDRANT_KEY,GEMINI_API_KEY=YOUR_GEMINI_KEY"
 ```
 
 ---
 
-## Usage
+## API Reference
 
-### Upload a Document
+### Upload API
 
-```powershell
-# PowerShell
-Add-Type -AssemblyName System.Net.Http
-$client = [System.Net.Http.HttpClient]::new()
-$form = [System.Net.Http.MultipartFormDataContent]::new()
-$fileStream = [System.IO.File]::OpenRead("path/to/document.pdf")
-$fileContent = [System.Net.Http.StreamContent]::new($fileStream)
-$fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new("application/pdf")
-$form.Add($fileContent, "file", "document.pdf")
-$response = $client.PostAsync("https://YOUR_UPLOAD_API/upload", $form).Result
-Write-Host $response.Content.ReadAsStringAsync().Result
+**GET /health** — deep health check, probes GCS bucket
+
+```cmd
+curl https://YOUR_UPLOAD_API_URL/health
 ```
 
-### Query the RAG System
-
-```powershell
-Invoke-RestMethod `
-  -Uri "https://YOUR_QUERY_API/query" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body '{"question": "What is artificial intelligence?"}'
+```json
+{
+  "status": "ok",
+  "api": "upload-api",
+  "services": {
+    "gcs": { "status": "ok", "latency_ms": 92 }
+  }
+}
 ```
 
-### Check Qdrant Collection
+**POST /upload**
 
-```powershell
-curl.exe -X GET "https://YOUR_QDRANT_URL/collections/rag_documents" `
-  -H "api-key: YOUR_QDRANT_API_KEY"
+```cmd
+curl -X POST https://YOUR_UPLOAD_API_URL/upload -F "file=@C:\path\to\document.pdf"
+```
+
+```json
+{
+  "fileId": "uuid-here",
+  "fileURL": "https://storage.googleapis.com/bucket/uuid-here.pdf"
+}
 ```
 
 ---
 
-## Supported File Types
+### Query API
 
-| Type | MIME Type |
+**GET /health** — deep health check, probes Vertex AI + Qdrant + Gemini
+
+```cmd
+curl https://YOUR_QUERY_API_URL/health
+```
+
+```json
+{
+  "status": "ok",
+  "api": "query-api",
+  "services": {
+    "vertex_ai": { "status": "ok", "latency_ms": 345 },
+    "qdrant":    { "status": "ok", "latency_ms": 176 },
+    "gemini":    { "status": "ok", "latency_ms": 435 }
+  }
+}
+```
+
+Status values: `ok` / `degraded` / `down`. HTTP 503 when any service is `down`.
+
+**POST /query — non-streaming**
+
+```cmd
+curl -X POST https://YOUR_QUERY_API_URL/query -H "Content-Type: application/json" -d "{\"question\": \"What is machine learning?\", \"stream\": false}"
+```
+
+```json
+{
+  "query": "What is machine learning?",
+  "answer": "Machine learning is a technique by which...",
+  "source_pages": [
+    {
+      "page_number": 9,
+      "fileURL": "https://storage.googleapis.com/bucket/uuid.pdf",
+      "relevance_score": 0.6559
+    }
+  ]
+}
+```
+
+**POST /query — streaming (SSE)**
+
+```cmd
+curl -X POST https://YOUR_QUERY_API_URL/query -H "Content-Type: application/json" -H "Accept: text/event-stream" -d "{\"question\": \"What is machine learning?\", \"stream\": true}" --no-buffer
+```
+
+```
+data: {"type": "token",   "content": "Machine learning is"}
+data: {"type": "token",   "content": " a technique by which..."}
+data: {"type": "sources", "content": [{...}]}
+data: {"type": "done"}
+```
+
+Three event types: `token` — append to answer, `sources` — render citations, `done` — close connection.
+
+---
+
+## Processing Pipeline — Resilience Details
+
+| Feature | Detail |
 |---|---|
-| PDF | `application/pdf` |
-| JPEG | `image/jpeg` |
+| Batch size | 5 pages per Vertex AI call, 5 points per Qdrant upsert |
+| Retry policy | 3 attempts per batch — 2s → 10s → 30s backoff |
+| Failure isolation | One batch fails → others continue, partial results saved |
+| Idempotency | Point ID = hash(fileId + page_number) — re-runs never duplicate |
+| Image-only pages | Detected by char count < 20, skipped gracefully with log |
 
 ---
 
-## Sample Documents
+## End-to-End Test (Windows cmd)
 
-The pipeline has been tested with the following document types:
-- AI & Machine Learning (Artificial Intelligence, AI Agents, Generative AI, Neural Networks)
-- Science (Black Holes, Human Genome)
-- Medicine (Human Anatomy, Human Brain)
-- History (World War 1, World War 2)
-- Economics (Technological Unemployment)
+```cmd
+:: 1. Upload a PDF
+curl -X POST https://YOUR_UPLOAD_API_URL/upload -F "file=@C:\path\to\document.pdf"
+
+:: 2. Wait 30-60 seconds for processing
+
+:: 3. Query with streaming
+curl -X POST https://YOUR_QUERY_API_URL/query -H "Content-Type: application/json" -H "Accept: text/event-stream" -d "{\"question\": \"Your question here\", \"stream\": true}" --no-buffer
+
+:: 4. Check processing logs
+gcloud functions logs read process-document --region=us-central1 --limit=20
+```
 
 ---
+
+## Notes
+
+- Document AI free tier: 15 pages per request. Trim large PDFs to 10 pages before uploading.
+- Qdrant free tier: 1GB storage — sufficient for hundreds of documents.
+- All Cloud Run services scale to zero when idle — no idle costs.
+- Always use **cmd** on Windows, not PowerShell — curl flags like `-X`, `-H`, `-F` are intercepted by PowerShell.
+- The `X-Accel-Buffering: no` header on the Query API disables nginx buffering on Cloud Run, required for SSE streaming to work correctly.

@@ -1,0 +1,64 @@
+
+
+Processing Pipeline:
+
+
+# 1. Upload a new test file
+$uploadUrl = "https://upload-api-556864534593.us-central1.run.app/upload"
+$filePath = "C:\Users\shiva\OneDrive\Documents\Rag_QdrantVB_Shivani\document_rag_text\World_War_1.pdf"
+
+Add-Type -AssemblyName System.Net.Http
+$client = [System.Net.Http.HttpClient]::new()
+$form = [System.Net.Http.MultipartFormDataContent]::new()
+$fileStream = [System.IO.File]::OpenRead($filePath)
+$fileContent = [System.Net.Http.StreamContent]::new($fileStream)
+$fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new("application/pdf")
+$form.Add($fileContent, "file", "World_War_1.pdf")
+$response = $client.PostAsync($uploadUrl, $form).Result
+Write-Host "Uploaded: $($response.Content.ReadAsStringAsync().Result)"
+$fileStream.Close()
+$client.Dispose()
+
+# 2. Wait and check logs
+Start-Sleep -Seconds 30
+gcloud functions logs read process-document `
+  --region=us-central1 `
+  --limit=20 `
+  --project=rag-qdrantvb-shivani
+
+# 3. Check Qdrant points count
+Start-Sleep -Seconds 60
+curl.exe -X GET "https://4f141c02-cfe9-4105-bda2-bcfeb4b17fdd.us-east4-0.gcp.cloud.qdrant.io/collections/rag_documents" `
+  -H "api-key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6OTFhMWFjZGMtZWFiMi00NDdmLWE1OGYtZWFkOGZmMTQzNTY1In0.DH6Y3_4afowp10iWyIoUXkBSqsWhXjA-NyyczByCa1c"
+
+
+
+
+
+
+Processing pipeline:
+
+gcloud functions logs read process-document --region=us-central1 --limit=20
+
+
+
+
+
+Live Queries: (Upload query to run in terminal)
+
+Invoke-RestMethod -Uri "https://query-api-556864534593.us-central1.run.app/query" -Method Post
+-ContentType "application/json" -Body '{"question": "What is artificial intelligence?"}'
+
+
+
+...-Body '{"question": "What caused World War 1?"}'
+
+
+
+
+Ifi run this in terminal will get
+
+curl.exe -X POST "https://query-api-556864534593.us-central1.run.app/query" `
+>>   -H "Content-Type: application/json" `
+>>   -d '{\"question\": \"What is artificial intelligence?\"}'
+
